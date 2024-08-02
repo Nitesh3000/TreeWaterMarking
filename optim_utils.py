@@ -1,5 +1,6 @@
 import torch
 from torchvision import transforms
+# pip install datasets
 from datasets import load_dataset
 
 from PIL import Image, ImageFilter
@@ -9,6 +10,80 @@ import copy
 from typing import Any, Mapping
 import json
 import scipy
+import os
+from PIL import Image, ImageOps
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import torch.fft as fft
+from torchvision.utils import save_image
+
+# def save_image(image, path):
+#     """Save a PIL image to the specified path."""
+    
+#     image.save(path)
+#     image_array = np.array(image)    
+    
+#     # Convert to grayscale if it's a color image
+#     if len(image_array.shape) == 3:
+#         image_array = np.mean(image_array, axis=2)
+    
+#     # Compute the 2D FFT
+#     fft_image = np.fft.fft2(image_array)
+    
+#     # Shift the zero frequency component to the center
+#     fft_image_centered = np.fft.fftshift(fft_image)
+    
+#     # Compute the magnitude spectrum
+#     magnitude_spectrum = np.abs(fft_image_centered)
+#     magnitude_spectrum_log = np.log(1 + magnitude_spectrum)
+    
+#     # Plot the result
+#     plt.imshow(magnitude_spectrum_log, cmap='inferno')
+#     plt.title('Fourier Transform')
+#     plt.axis('off')  # Hide axes
+#     # Use a logarithmic scale for better visualization
+    
+    # plt.savefig(f'{path}_fft.png', bbox_inches='tight', pad_inches=0, dpi=300)
+    # # return magnitude_spectrum_log
+    # plt.close()  # Close the figure to avoid memory leaks
+
+
+# def compare_fourier_images(latents_no_w, latents_w, save_path_diff):
+#     # Ensure latents are on CPU and convert to float32
+#     latents_no_w = latents_no_w.cpu().to(torch.float32)
+#     latents_w = latents_w.cpu().to(torch.float32)
+
+#     # Shift the Fourier-transformed images to center the zero-frequency component
+#     fourier_shifted_no_w = fft.fftshift(latents_no_w)
+#     fourier_shifted_w = fft.fftshift(latents_w)
+
+#     # Compute the difference in the Fourier magnitude spectra
+#     magnitude_diff = torch.abs(fourier_shifted_w) - torch.abs(fourier_shifted_no_w)
+#     magnitude_diff_np = magnitude_diff.numpy()
+
+#     # Plot and save the difference in Fourier magnitude spectra
+#     plt.imshow(magnitude_diff_np, cmap='inferno')
+#     plt.axis('off')
+#     plt.savefig(save_path_diff, bbox_inches='tight', pad_inches=0, dpi=300)
+#     plt.close()
+
+
+def create_directories(base_dir, image_index):
+    """Create directories for saving images."""
+    dirs = {
+        'original': os.path.join(base_dir, f'image_{image_index}'),
+        'distorted': os.path.join(base_dir, f'image_{image_index}'),
+        'watermarked': os.path.join(base_dir, f'image_{image_index}'),
+        'fourier_before': os.path.join(base_dir, f'image_{image_index}'),
+        'fourier_after': os.path.join(base_dir, f'image_{image_index}'),
+    }
+    for dir_path in dirs.values():
+        os.makedirs(dir_path, exist_ok=True)
+    return dirs
+
+
+
 
 
 def read_json(filename: str) -> Mapping[str, Any]:
@@ -35,7 +110,8 @@ def transform_img(image, target_size=512):
         ]
     )
     image = tform(image)
-    return 2.0 * image - 1.0
+    #scales the pixel values from the range [0, 1] to the range [-1, 1].
+    return 2.0 * image - 1.0 #it can improve the convergence of training algorithms.
 
 
 def latents_to_imgs(pipe, latents):
@@ -122,7 +198,7 @@ def circle_mask(size=64, r=10, x_offset=0, y_offset=0):
 
     return ((x - x0)**2 + (y-y0)**2)<= r**2
 
-
+# Returns a binary mask tensor of the same shape as init_latents_w, with specified watermarking regions set to True.
 def get_watermarking_mask(init_latents_w, args, device):
     watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
 
@@ -193,8 +269,11 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
     return gt_patch
 
 
-def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args):
+def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args,i):
     init_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(init_latents_w), dim=(-1, -2))
+    # orig_image_w.save(os.path.join(img_dir, 'w_image.png'))
+    save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_no_w_image.png")
+    save_image(init_latents_w_fft[0].real, f"{args.output_dir}/image_{i}/fft_no_w_image.png")
     if args.w_injection == 'complex':
         init_latents_w_fft[watermarking_mask] = gt_patch[watermarking_mask].clone()
     elif args.w_injection == 'seed':
@@ -203,8 +282,12 @@ def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args):
     else:
         NotImplementedError(f'w_injection: {args.w_injection}')
 
+        
+    # else:
+    #     NotImplementedError(f'w_injection: {args.w_injection}')
+    save_image(init_latents_w_fft[0].real, f"{args.output_dir}/image_{i}/fft_w_image.png")
     init_latents_w = torch.fft.ifft2(torch.fft.ifftshift(init_latents_w_fft, dim=(-1, -2))).real
-
+    save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_w_image.png")
     return init_latents_w
 
 
@@ -220,9 +303,14 @@ def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask,
     else:
         NotImplementedError(f'w_measurement: {args.w_measurement}')
 
-    if 'l1' in args.w_measurement:
+    if 'l1' in args.w_measurement: # at positions specified by the watermarking_mask.
+        # assess how close the features of the non-watermarked image are to the watermark pattern
+        # indicating if the watermark is detectable or if the watermarking has altered the image latents significantly
         no_w_metric = torch.abs(reversed_latents_no_w_fft[watermarking_mask] - target_patch[watermarking_mask]).mean().item()
+        
+        
         w_metric = torch.abs(reversed_latents_w_fft[watermarking_mask] - target_patch[watermarking_mask]).mean().item()
+        # measures how well the watermark is embedded in the image latents with the watermark
     else:
         NotImplementedError(f'w_measurement: {args.w_measurement}')
 

@@ -4,6 +4,7 @@ import copy
 from tqdm import tqdm
 from statistics import mean, stdev
 from sklearn import metrics
+import os
 
 import torch
 
@@ -21,6 +22,8 @@ from io_utils import *
 
 def main(args):
     table = None
+    os.environ['REQUESTS_CA_BUNDLE'] = 'C:\\Users\\nites\\Desktop\\Sophos Certificate\\SecurityAppliance_SSL_CA.pem'
+
     if args.with_tracking:
         wandb.init(project='diffusion_watermark', name=args.run_name, tags=['latent_watermark_fourier_openai'])
         wandb.config.update(args)
@@ -155,13 +158,13 @@ if __name__ == '__main__':
     parser.add_argument('--run_name', default='test')
     parser.add_argument('--dataset', default='Gustavosta/Stable-Diffusion-Prompts')
     parser.add_argument('--start', default=0, type=int)
-    parser.add_argument('--end', default=10, type=int)
+    parser.add_argument('--end', default=2, type=int)
     parser.add_argument('--image_length', default=512, type=int)
     parser.add_argument('--model_id', default='256x256_diffusion')
     parser.add_argument('--with_tracking', action='store_true')
     parser.add_argument('--num_images', default=1, type=int)
     parser.add_argument('--guidance_scale', default=7.5, type=float)
-    parser.add_argument('--num_inference_steps', default=50, type=int)
+    parser.add_argument('--num_inference_steps', default=10, type=int)
     parser.add_argument('--test_num_inference_steps', default=None, type=int)
     parser.add_argument('--reference_model', default=None)
     parser.add_argument('--reference_model_pretrain', default=None)

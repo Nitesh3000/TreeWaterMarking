@@ -172,7 +172,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="diffusion watermark")
-    parser.add_argument("--run_name", default="test")
+    parser.add_argument("--run_name", default="train")
     parser.add_argument("--start", default=0, type=int)
     parser.add_argument("--end", default=10, type=int)
     parser.add_argument("--image_length", default=512, type=int)
@@ -200,6 +200,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     args.__dict__.update(model_and_diffusion_defaults())
-    args.__dict__.update(read_json(f"openai_config/{args.model_id}.json"))
+    args.__dict__.update(read_json(f"{args.model_id}.json"))
 
     main(args)
