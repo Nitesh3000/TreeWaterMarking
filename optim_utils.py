@@ -18,57 +18,6 @@ import matplotlib.pyplot as plt
 import torch.fft as fft
 from torchvision.utils import save_image
 
-# def save_image(image, path):
-#     """Save a PIL image to the specified path."""
-    
-#     image.save(path)
-#     image_array = np.array(image)    
-    
-#     # Convert to grayscale if it's a color image
-#     if len(image_array.shape) == 3:
-#         image_array = np.mean(image_array, axis=2)
-    
-#     # Compute the 2D FFT
-#     fft_image = np.fft.fft2(image_array)
-    
-#     # Shift the zero frequency component to the center
-#     fft_image_centered = np.fft.fftshift(fft_image)
-    
-#     # Compute the magnitude spectrum
-#     magnitude_spectrum = np.abs(fft_image_centered)
-#     magnitude_spectrum_log = np.log(1 + magnitude_spectrum)
-    
-#     # Plot the result
-#     plt.imshow(magnitude_spectrum_log, cmap='inferno')
-#     plt.title('Fourier Transform')
-#     plt.axis('off')  # Hide axes
-#     # Use a logarithmic scale for better visualization
-    
-    # plt.savefig(f'{path}_fft.png', bbox_inches='tight', pad_inches=0, dpi=300)
-    # # return magnitude_spectrum_log
-    # plt.close()  # Close the figure to avoid memory leaks
-
-
-# def compare_fourier_images(latents_no_w, latents_w, save_path_diff):
-#     # Ensure latents are on CPU and convert to float32
-#     latents_no_w = latents_no_w.cpu().to(torch.float32)
-#     latents_w = latents_w.cpu().to(torch.float32)
-
-#     # Shift the Fourier-transformed images to center the zero-frequency component
-#     fourier_shifted_no_w = fft.fftshift(latents_no_w)
-#     fourier_shifted_w = fft.fftshift(latents_w)
-
-#     # Compute the difference in the Fourier magnitude spectra
-#     magnitude_diff = torch.abs(fourier_shifted_w) - torch.abs(fourier_shifted_no_w)
-#     magnitude_diff_np = magnitude_diff.numpy()
-
-#     # Plot and save the difference in Fourier magnitude spectra
-#     plt.imshow(magnitude_diff_np, cmap='inferno')
-#     plt.axis('off')
-#     plt.savefig(save_path_diff, bbox_inches='tight', pad_inches=0, dpi=300)
-#     plt.close()
-
-
 def create_directories(base_dir, image_index):
     """Create directories for saving images."""
     dirs = {
