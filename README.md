@@ -16,9 +16,9 @@ Includes utilities for saving and visualizing watermarked images and their trans
 ### Wavelet Transform Integration: 
 Added support for watermarking in both high and low frequency components using Dual-Tree Complex Wavelet Transform (DTCWT). This allows for more robust and fine-grained control over watermark placement in image frequency domains.
 ### Image Watermarking: 
-Implemented watermark injection in the highest and lowest frequency components, ensuring the watermark is embedded effectively across different scales of the image.
+Implemented watermark injection in the highest and lowest frequency components of wavelet domain, ensuring the watermark is embedded effectively across different scales of the image.
 ### Visualization: 
-Developed functionality to save various stages of image processing for visualization purposes, including before and after watermarking, as well as the effect of watermarking in the frequency domain.
+Developed functionality to save various stages of processing for visualization purposes, including before and after watermarking, as well as the effect of watermarking in the wavelet domain.
 
 ## Folder Structure
 ### output_images/
