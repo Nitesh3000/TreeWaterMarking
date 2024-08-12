@@ -139,9 +139,9 @@ def get_dataset(args):
     return dataset, prompt_key
 
 
-def circle_mask(size=64, r=10, x_offset=0, y_offset=0):
+def circle_mask(size=64, r=10, x_offset=0, y_offset=0): #True inside the circle, False elseWhere
     # reference: https://stackoverflow.com/questions/69687798/generating-a-soft-circluar-mask-using-numpy-python-3
-    x0 = y0 = size // 2
+    x0 = y0 = size // 2 #center of the grid
     x0 += x_offset
     y0 += y_offset
     y, x = np.ogrid[:size, :size]
@@ -149,37 +149,8 @@ def circle_mask(size=64, r=10, x_offset=0, y_offset=0):
 
     return ((x - x0)**2 + (y-y0)**2)<= r**2
 
-# Returns a binary mask tensor of the same shape as init_latents_w, with specified watermarking regions set to True.
-def get_watermarking_mask(init_latents_w, args, device):
-    watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
-
-    if args.w_mask_shape == 'circle':
-        np_mask = circle_mask(init_latents_w.shape[-1], r=args.w_radius)
-        torch_mask = torch.tensor(np_mask).to(device)
-
-        if args.w_channel == -1:
-            # all channels
-            watermarking_mask[:, :] = torch_mask
-        else:
-            watermarking_mask[:, args.w_channel] = torch_mask
-    elif args.w_mask_shape == 'square':
-        anchor_p = init_latents_w.shape[-1] // 2
-        if args.w_channel == -1:
-            # all channels
-            watermarking_mask[:, :, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
-        else:
-            watermarking_mask[:, args.w_channel, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
-    elif args.w_mask_shape == 'no':
-        pass
-    else:
-        raise NotImplementedError(f'w_mask_shape: {args.w_mask_shape}')
-    resized_mask = F.interpolate(watermarking_mask.float(), size=(16, 16), mode='bilinear', align_corners=False)
-    resized_mask = resized_mask > 0.5
-    return resized_mask
-
-
 def get_watermarking_pattern(pipe, args, device, shape=None):
-    dtcwt_forward = DTCWTForward(J=3, biort='near_sym_b', qshift='qshift_b').to(device)
+    dtcwt_forward = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
     dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
     
     set_random_seed(args.w_seed)
@@ -197,9 +168,15 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
             tmp_mask = circle_mask(gt_init.shape[-1], r=i)
             tmp_mask = torch.tensor(tmp_mask).to(device)
             
+            # Resize mask to match gt_patch dimensions
+            tmp_mask_resized = F.interpolate(tmp_mask.unsqueeze(0).unsqueeze(0).float(), 
+                                             size=(gt_patch.shape[-2], gt_patch.shape[-1]), 
+                                             mode='bilinear', align_corners=False).bool().squeeze()
+
             for j in range(gt_patch.shape[1]):
-                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
-    
+                # Use proper indexing and mask assignment
+                gt_patch[:, j] = torch.where(tmp_mask_resized, gt_patch_tmp[:, j], gt_patch[:, j])
+
     elif 'seed_zeros' in args.w_pattern:
         gt_patch = gt_init * 0
     
@@ -224,22 +201,61 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
     
     elif 'ring' in args.w_pattern:
         Yl, Yh = dtcwt_forward(gt_init)
-        gt_patch = Yl
-        gt_patch_tmp = copy.deepcopy(Yl)
+        gt_patch = Yl.clone()
+        # gt_patch_tmp = copy.deepcopy(Yl)
+        gt_patch_tmp = Yl.clone()
         for i in range(args.w_radius, 0, -1):
-            tmp_mask = circle_mask(gt_init.shape[-1], r=i)
+            tmp_mask = circle_mask(gt_init.shape[-1], r=i) #shape of the latent
             tmp_mask = torch.tensor(tmp_mask).to(device)
             
-            for j in range(gt_patch.shape[1]):
-                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
+            # Resize mask to match gt_patch dimensions
+            #interpolate happens on the 4d tensor
+            tmp_mask_resized = F.interpolate(tmp_mask.unsqueeze(0).unsqueeze(0).float(), 
+                                             size=(gt_patch.shape[-2], gt_patch.shape[-1]), 
+                                             mode='bilinear', align_corners=False).bool().squeeze() #bilinear works for 2d image with 4d tensor
 
-    print("type of gt_patch: ", gt_patch.type())
-    resized_mask = F.interpolate(gt_patch.float(), size=(16, 16), mode='bilinear', align_corners=False)
+            # Ensure the mask and tensors have the same dimensions
+            if gt_patch.shape[2:] == tmp_mask_resized.shape:
+                gt_patch[:, :, tmp_mask_resized] = gt_patch_tmp[:, :, tmp_mask_resized] #batch, channel, height,width
+
+    # print("type of gt_patch: ", gt_patch.type())
+    # resized_mask = F.interpolate(gt_patch.float(), size=(16, 16), mode='bilinear', align_corners=False)
     return gt_patch
+
+
+# Returns a binary mask tensor of the same shape as init_latents_w, with specified watermarking regions set to True.
+def get_watermarking_mask(init_latents_w, args, device):
+    watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
+
+    if args.w_mask_shape == 'circle':
+        np_mask = circle_mask(init_latents_w.shape[-1], r=args.w_radius)
+        torch_mask = torch.tensor(np_mask).to(device) 
+
+        if args.w_channel == -1:
+            # all channels
+            watermarking_mask[:, :] = torch_mask
+        else:
+            watermarking_mask[:, args.w_channel] = torch_mask  #spatial dimensions and channels
+    elif args.w_mask_shape == 'square':
+        anchor_p = init_latents_w.shape[-1] // 2
+        if args.w_channel == -1:
+            # all channels
+            watermarking_mask[:, :, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
+        else:
+            watermarking_mask[:, args.w_channel, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
+    elif args.w_mask_shape == 'no':
+        pass
+    else:
+        raise NotImplementedError(f'w_mask_shape: {args.w_mask_shape}')
+    resized_mask = F.interpolate(watermarking_mask.float(), size=(16, 16), mode='bilinear', align_corners=False)
+    resized_mask = resized_mask > 0.5
+    return resized_mask
+
+
 
 def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i, device):
     # Perform Dual-Tree Complex Wavelet Transform (DTCWT)
-    dwt = DTCWTForward(J=3, biort='near_sym_b', qshift='qshift_b').to(device)
+    dwt = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
     dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
     
     # Apply DTCWT and get the coefficients
@@ -258,44 +274,36 @@ def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i, devic
     save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_no_w_image.png")
     save_image(init_latents_w_dwt[0, 0].real, f"{args.output_dir}/image_{i}/dwt_no_w_image.png")  # Save the real part of the low-frequency component
 
-    # Inject watermark into the lowest frequency component
-    if args.w_injection == 'complex':
-        init_latents_w_dwt[resized_mask] = resized_gt_patch[resized_mask].clone()
-    elif args.w_injection == 'seed':
-        init_latents_w[watermarking_mask] = gt_patch[watermarking_mask].clone()
-        return init_latents_w
-    else:
-        raise NotImplementedError(f'w_injection: {args.w_injection}')
+    # Inject watermark into the middle frequency components
+    if len(yh) > 2:  # Ensure there are at least three frequency bands (low, middle, high)
+        # Process middle frequency components, excluding the first (low) and last (high) components
+        for j in range(1, len(yh) - 1):
+            # Resize the watermark mask and patch to match the current frequency component size
+            middle_freq_mask = F.interpolate(watermarking_mask.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).bool().to(device)
+            resized_gt_patch_middle = F.interpolate(gt_patch.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).to(device)
 
-    # Inject watermark into the highest frequency component only
-    if len(yh) > 0:
-        j = len(yh) - 1  
-        # Resize the watermark mask and patch to match the high-frequency component size
-        high_freq_mask = F.interpolate(watermarking_mask.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).bool().to(device)
-        resized_gt_patch_high = F.interpolate(gt_patch.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).to(device)
+            # Ensure data types match
+            if yh[j].dtype != resized_gt_patch_middle.dtype:
+                resized_gt_patch_middle = resized_gt_patch_middle.to(yh[j].dtype)
 
-        # Ensure data types match
-        if yh[j].dtype != resized_gt_patch_high.dtype:
-            resized_gt_patch_high = resized_gt_patch_high.to(yh[j].dtype)
+            # Adjust dimensions for broadcasting
+            middle_freq_mask = middle_freq_mask.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
+            resized_gt_patch_middle = resized_gt_patch_middle.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
 
-        # Adjust dimensions for broadcasting
-        high_freq_mask = high_freq_mask.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
-        resized_gt_patch_high = resized_gt_patch_high.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
+            # Broadcast mask and watermark patch to match the shape of yh[j]
+            middle_freq_mask = middle_freq_mask.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
+            resized_gt_patch_middle = resized_gt_patch_middle.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
 
-        # Broadcast mask and watermark patch to match the shape of yh[j]
-        high_freq_mask = high_freq_mask.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
-        resized_gt_patch_high = resized_gt_patch_high.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
+            if args.w_injection == 'complex':
+                yh[j][middle_freq_mask] = resized_gt_patch_middle[middle_freq_mask].clone()
+            elif args.w_injection == 'seed':
+                yh[j] = resized_gt_patch_middle.clone()
+            else:
+                raise NotImplementedError(f'w_injection: {args.w_injection}')
 
-        if args.w_injection == 'complex':
-            yh[j][high_freq_mask] = resized_gt_patch_high[high_freq_mask].clone()
-        elif args.w_injection == 'seed':
-            yh[j] = resized_gt_patch_high.clone()
-        else:
-            raise NotImplementedError(f'w_injection: {args.w_injection}')
-
-        yh_real_part = yh[j][0, :, 0, :, :, 0].real  # Extract a 2D slice that can be saved as an image
-        yh_real_part = (yh_real_part - yh_real_part.min()) / (yh_real_part.max() - yh_real_part.min())  # Normalize to [0, 1]
-        save_image(yh_real_part, f"{args.output_dir}/image_{i}/yh_w_image_highest.png")
+            yh_real_part = yh[j][0, :, 0, :, :, 0].real  # Extract a 2D slice that can be saved as an image
+            yh_real_part = (yh_real_part - yh_real_part.min()) / (yh_real_part.max() - yh_real_part.min())  # Normalize to [0, 1]
+            save_image(yh_real_part, f"{args.output_dir}/image_{i}/yh_w_image_middle_{j}.png")
 
     # Perform Inverse Dual-Tree Complex Wavelet Transform (IDTCWT)
     init_latents_w = dtcwt_inverse((init_latents_w_dwt, yh))  # Apply IDWT to get the image back
@@ -304,12 +312,9 @@ def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i, devic
     return init_latents_w
 
 
-
-
-
 def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args, device):
     # Initialize the DTCWT and its inverse
-    dwt = DTCWTForward(J=3, biort='near_sym_b', qshift='qshift_b').to(device)
+    dwt = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
     dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
     
     if 'complex' in args.w_measurement:
