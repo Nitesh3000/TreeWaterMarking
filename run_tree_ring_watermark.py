@@ -7,6 +7,7 @@ from sklearn import metrics
 import matplotlib.pyplot as plt
 
 import torch
+torch.set_default_dtype(torch.float16)
 # import datasets
 from inverse_stable_diffusion import InversableStableDiffusionPipeline
 from diffusers import DPMSolverMultistepScheduler
@@ -14,8 +15,10 @@ import open_clip
 from optim_utils import *
 from io_utils import *
 import os
+from pytorch_wavelets import DTCWTForward, DTCWTInverse
 
 def main(args):
+    
     base_dir = args.output_dir
     os.makedirs(base_dir, exist_ok=True)
     table = None
@@ -30,8 +33,12 @@ def main(args):
     # load diffusion model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running on device: {device}")
-    
+    dtcwt_forward = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
+    dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
+    # scheduler is responsible for guiding the diffusion process.
     scheduler = DPMSolverMultistepScheduler.from_pretrained(args.model_id, subfolder='scheduler')
+    
+    # pipe is the main pipeline that integrates the model and scheduler to generate images from text or latent inputs.
     pipe = InversableStableDiffusionPipeline.from_pretrained(
         args.model_id,
         scheduler=scheduler,
@@ -41,6 +48,7 @@ def main(args):
         )
     pipe = pipe.to(device)
     print(f"Model ID: {args.model_id}")
+    
     total_params = (
         sum(p.numel() for p in pipe.unet.parameters()) +
         sum(p.numel() for p in pipe.vae.parameters()) +
@@ -99,9 +107,11 @@ def main(args):
         image_list = latents_to_imgs(pipe, init_latents_w)
 
         watermarking_mask = get_watermarking_mask(init_latents_w, args, device)
-        init_latents_w = inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i)
-        
-        image_list = latents_to_imgs(pipe, init_latents_w)
+        # grayscale_watermark_Yl, grayscale_watermark_Yh = get_grayscale_watermark(args.watermark_image_path, dtcwt_forward, device)
+
+        init_latents_w = inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i,device)
+        # init_latents_w = inject_watermark(init_latents_w, grayscale_watermark_Yl, grayscale_watermark_Yh, args, i, device)
+        # image_list = latents_to_imgs(pipe, init_latents_w)
         
         outputs_w = pipe(
             current_prompt,
@@ -139,7 +149,7 @@ def main(args):
             num_inference_steps=args.test_num_inference_steps,
         )
 
-        no_w_metric, w_metric = eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args)
+        no_w_metric, w_metric = eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args,device)
         if args.reference_model is not None:
             sims = measure_similarity([orig_image_no_w, orig_image_w], current_prompt, ref_model, ref_clip_preprocess, ref_tokenizer, device)
             w_no_sim = sims[0].item()
@@ -188,11 +198,11 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='diffusion watermark')
     parser.add_argument('--run_name', default='train')
-    # parser.add_argument('--dataset', default='coco')
-    parser.add_argument('--dataset', default='Gustavosta/Stable-Diffusion-Prompts')
-    parser.add_argument('--output_dir', default='output_images', type=str)
-    parser.add_argument('--start', default=0, type=int)
-    parser.add_argument('--end', default=10, type=int)
+    parser.add_argument('--dataset', default='coco')
+    # parser.add_argument('--dataset', default='Gustavosta/Stable-Diffusion-Prompts')
+    parser.add_argument('--output_dir', default='output_images/waveletHighestAndLowestRingsBlurredCOCO1J=3/trial', type=str)
+    parser.add_argument('--start', default=60, type=int)
+    parser.add_argument('--end', default=70, type=int)
     parser.add_argument('--image_length', default=512, type=int)
     parser.add_argument('--model_id', default='stabilityai/stable-diffusion-2-1-base')
     parser.add_argument('--with_tracking', action='store_true')
@@ -215,6 +225,7 @@ if __name__ == '__main__':
     parser.add_argument('--w_measurement', default='l1_complex')
     parser.add_argument('--w_injection', default='complex') #seed used for direct injection in spatial doman.. complex in freq domain
     parser.add_argument('--w_pattern_const', default=0, type=float)
+    parser.add_argument('--watermark_image_path', default="C:\\Users\\nites\\Downloads\\tree-ring-watermark-main (1)\\tree-ring-watermark-main\\Fresh_Apple_PNG_Clip_Art_Image.png", type=str)
     
     # for image distortion
     parser.add_argument('--r_degree', default=None, type=float)

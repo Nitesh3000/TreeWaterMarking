@@ -139,15 +139,13 @@ def get_dataset(args):
     return dataset, prompt_key
 
 
-def circle_mask(size=64, r=10, x_offset=0, y_offset=0): #True inside the circle, False elseWhere
-    # reference: https://stackoverflow.com/questions/69687798/generating-a-soft-circluar-mask-using-numpy-python-3
-    x0 = y0 = size // 2 #center of the grid
-    x0 += x_offset
-    y0 += y_offset
+def circle_mask(size, r):
+    """Generate a binary mask with a circle of radius `r`."""
     y, x = np.ogrid[:size, :size]
-    y = y[::-1]
+    mask = (x - size // 2) ** 2 + (y - size // 2) ** 2 <= r ** 2
+    return mask.astype(np.float32)
 
-    return ((x - x0)**2 + (y-y0)**2)<= r**2
+
 
 def get_watermarking_pattern(pipe, args, device, shape=None):
     dtcwt_forward = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
@@ -222,8 +220,6 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
     # resized_mask = F.interpolate(gt_patch.float(), size=(16, 16), mode='bilinear', align_corners=False)
     return gt_patch
 
-
-# Returns a binary mask tensor of the same shape as init_latents_w, with specified watermarking regions set to True.
 def get_watermarking_mask(init_latents_w, args, device):
     watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
 
@@ -310,6 +306,7 @@ def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i, devic
 
     save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_w_image.png")
     return init_latents_w
+
 
 
 def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args, device):
