@@ -20,6 +20,9 @@ from torchvision.utils import save_image
 from pytorch_wavelets import DTCWTForward, DTCWTInverse
 import pytorch_wavelets as pw
 import torch.nn.functional as F
+from scipy.fftpack import dct
+import torch_dct as dct
+from torchvision.transforms import ToTensor
 def create_directories(base_dir, image_index):
     """Create directories for saving images."""
     dirs = {
@@ -139,18 +142,46 @@ def get_dataset(args):
     return dataset, prompt_key
 
 
-def circle_mask(size, r):
-    """Generate a binary mask with a circle of radius `r`."""
-    y, x = np.ogrid[:size, :size]
-    mask = (x - size // 2) ** 2 + (y - size // 2) ** 2 <= r ** 2
-    return mask.astype(np.float32)
 
+def circle_mask(size=64, r=10, x_offset=0, y_offset=0):
+    # reference: https://stackoverflow.com/questions/69687798/generating-a-soft-circluar-mask-using-numpy-python-3
+    x0 = y0 = size // 2
+    x0 += x_offset
+    y0 += y_offset
+    y, x = np.ogrid[:size, :size]
+    y = y[::-1]
+    return ((x - x0)**2 + (y-y0)**2)<= r**2
+# Returns a binary mask tensor of the same shape as init_latents_w, with specified watermarking regions set to True.
+def get_watermarking_mask(init_latents_w, args, device):
+    watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
+
+    if args.w_mask_shape == 'circle':
+        np_mask = circle_mask(init_latents_w.shape[-1], r=args.w_radius)
+        torch_mask = torch.tensor(np_mask).to(device)
+
+        if args.w_channel == -1:
+            # Apply to all channels
+            watermarking_mask[:, :] = torch_mask
+        else:
+            # Apply to a specific channel
+            watermarking_mask[:, args.w_channel] = torch_mask
+    elif args.w_mask_shape == 'square':
+        anchor_p = init_latents_w.shape[-1] // 2
+        if args.w_channel == -1:
+            # Apply to all channels
+            watermarking_mask[:, :, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
+        else:
+            # Apply to a specific channel
+            watermarking_mask[:, args.w_channel, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
+    elif args.w_mask_shape == 'no':
+        pass
+    else:
+        raise NotImplementedError(f'w_mask_shape: {args.w_mask_shape}')
+
+    return watermarking_mask
 
 
 def get_watermarking_pattern(pipe, args, device, shape=None):
-    dtcwt_forward = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
-    dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
-    
     set_random_seed(args.w_seed)
     
     if shape is not None:
@@ -158,210 +189,236 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
     else:
         gt_init = pipe.get_random_latents()
 
-    if 'seed_ring' in args.w_pattern:
-        gt_patch = gt_init.clone()
+    # Apply DCT if needed
+    if any(pattern in args.w_pattern for pattern in ['rand', 'zeros', 'const', 'ring']):
+        gt_init = gt_init.to(torch.float32)
+        gt_init = dct.dct_2d(gt_init,norm = "ortho")
+        gt_init = gt_init.to(torch.float16)
 
+    if 'seed_ring' in args.w_pattern:
+        gt_patch = gt_init
         gt_patch_tmp = copy.deepcopy(gt_patch)
         for i in range(args.w_radius, 0, -1):
             tmp_mask = circle_mask(gt_init.shape[-1], r=i)
             tmp_mask = torch.tensor(tmp_mask).to(device)
-            
-            # Resize mask to match gt_patch dimensions
-            tmp_mask_resized = F.interpolate(tmp_mask.unsqueeze(0).unsqueeze(0).float(), 
-                                             size=(gt_patch.shape[-2], gt_patch.shape[-1]), 
-                                             mode='bilinear', align_corners=False).bool().squeeze()
-
             for j in range(gt_patch.shape[1]):
-                # Use proper indexing and mask assignment
-                gt_patch[:, j] = torch.where(tmp_mask_resized, gt_patch_tmp[:, j], gt_patch[:, j])
-
+                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
     elif 'seed_zeros' in args.w_pattern:
         gt_patch = gt_init * 0
-    
     elif 'seed_rand' in args.w_pattern:
         gt_patch = gt_init
-    
     elif 'rand' in args.w_pattern:
-        Yl, Yh = dtcwt_forward(gt_init)
-        gt_patch = Yl
-        gt_patch[:] = gt_patch[0]
-    
+        gt_patch = gt_init
     elif 'zeros' in args.w_pattern:
-        Yl, Yh = dtcwt_forward(gt_init)
-        Yl *= 0
-        Yh = tuple(coeff * 0 for coeff in Yh)
-        gt_patch = Yl
-    
+        gt_patch = gt_init * 0
     elif 'const' in args.w_pattern:
-        Yl, Yh = dtcwt_forward(gt_init)
-        Yl *= 0
-        gt_patch = Yl + args.w_pattern_const
-    
+        gt_patch = gt_init * 0
+        gt_patch += args.w_pattern_const
     elif 'ring' in args.w_pattern:
-        Yl, Yh = dtcwt_forward(gt_init)
-        gt_patch = Yl.clone()
-        # gt_patch_tmp = copy.deepcopy(Yl)
-        gt_patch_tmp = Yl.clone()
+        gt_patch = gt_init
+        gt_patch_tmp = copy.deepcopy(gt_patch)
         for i in range(args.w_radius, 0, -1):
-            tmp_mask = circle_mask(gt_init.shape[-1], r=i) #shape of the latent
+            tmp_mask = circle_mask(gt_init.shape[-1], r=i)
             tmp_mask = torch.tensor(tmp_mask).to(device)
-            
-            # Resize mask to match gt_patch dimensions
-            #interpolate happens on the 4d tensor
-            tmp_mask_resized = F.interpolate(tmp_mask.unsqueeze(0).unsqueeze(0).float(), 
-                                             size=(gt_patch.shape[-2], gt_patch.shape[-1]), 
-                                             mode='bilinear', align_corners=False).bool().squeeze() #bilinear works for 2d image with 4d tensor
+            for j in range(gt_patch.shape[1]):
+                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
 
-            # Ensure the mask and tensors have the same dimensions
-            if gt_patch.shape[2:] == tmp_mask_resized.shape:
-                gt_patch[:, :, tmp_mask_resized] = gt_patch_tmp[:, :, tmp_mask_resized] #batch, channel, height,width
-
-    # print("type of gt_patch: ", gt_patch.type())
-    # resized_mask = F.interpolate(gt_patch.float(), size=(16, 16), mode='bilinear', align_corners=False)
     return gt_patch
 
-def get_watermarking_mask(init_latents_w, args, device):
-    watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
+def readImage(image_path,args,i):
+    image = Image.open(image_path).convert('RGB')
+    save_image_to_unique_folder(image, args.output_dir, i,"apple_image_for_watermarking")
+    
+    image_tensor = ToTensor()(image)
+    # if image_tensor.shape[0] == 4:
+    #     image_tensor = image_tensor[:3, :, :]
+    save_image_to_unique_folder(image_tensor, args.output_dir, i,"apple_image_for_watermarking_tensor")
+    # image_tensor = torch.tensor(np.array(image)).float() / 255.0
+    image_tensor = image_tensor.unsqueeze(0)
+    image_tensor = image_tensor.to(torch.float16)
+    # image_tensor = image_tensor.expand([1,3,475,584])
+    return image_tensor
 
-    if args.w_mask_shape == 'circle':
-        np_mask = circle_mask(init_latents_w.shape[-1], r=args.w_radius)
-        torch_mask = torch.tensor(np_mask).to(device) 
+def inject_watermark(init_latents_w, image, args, pipe, device,i):
+    # Obtain the latent representation of the image
+    image_latents = pipe.get_image_latents(image.to(device), sample=False)
+    save_image_to_unique_folder(image_latents, args.output_dir, i,"imageforwatermarkingLatents")
+    image_latents = image_latents.to(torch.float32)
+    watermark_size = (32, 32)  # Size of the watermark to be inserted
 
-        if args.w_channel == -1:
-            # all channels
-            watermarking_mask[:, :] = torch_mask
-        else:
-            watermarking_mask[:, args.w_channel] = torch_mask  #spatial dimensions and channels
-    elif args.w_mask_shape == 'square':
-        anchor_p = init_latents_w.shape[-1] // 2
-        if args.w_channel == -1:
-            # all channels
-            watermarking_mask[:, :, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
-        else:
-            watermarking_mask[:, args.w_channel, anchor_p-args.w_radius:anchor_p+args.w_radius, anchor_p-args.w_radius:anchor_p+args.w_radius] = True
-    elif args.w_mask_shape == 'no':
-        pass
+        # Resize the watermark
+    image_latents = F.interpolate(image_latents, size=watermark_size, mode='bilinear', align_corners=False)
+    # Perform DCT on the image latents
+    dct_image = dct.dct_2d(image_latents)
+    dct_image = dct_image.to(torch.float16)
+    save_image_to_unique_folder(dct_image, args.output_dir, i,"imageforwatermarkingLatents_DCT")
+    
+    if args.w_injection == 'complex':
+        init_latents_w = init_latents_w.clone()
+        save_image_to_unique_folder(init_latents_w, args.output_dir, i,"init_latents_w_not_watermarked")
+        init_latents_w = init_latents_w.to(torch.float32)
+        
+        # Perform DCT on the initial latents
+        init_latents_w_dct = dct.dct_2d(init_latents_w)
+        init_latents_w_dct = init_latents_w_dct.to(torch.float16)
+        save_image_to_unique_folder(init_latents_w_dct, args.output_dir, i,"init_latents_w_dct_not_watermarked")
+        
+        watermark_scale = 0.2
+        # watermark_size = (32, 32)  # Size of the watermark to be inserted
+
+        # Resize the watermark
+        # dct_image_resized = F.interpolate(dct_image, size=watermark_size, mode='bilinear', align_corners=False)
+
+        # Define the position to place the watermark (center of the latent image)
+        h, w = init_latents_w_dct.shape[-2:]
+        center_y, center_x = h // 2, w // 2
+        half_watermark_h, half_watermark_w = watermark_size[0] // 2, watermark_size[1] // 2
+
+        # Add the watermark to the center of the existing latents
+        init_latents_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                           center_x - half_watermark_w:center_x + half_watermark_w] += (
+            watermark_scale * dct_image
+        )
+        save_image_to_unique_folder(init_latents_w_dct, args.output_dir, i,"init_latents_w_dct after watermark injection")
+
+        # Perform IDCT to get back to the image space
+        init_latents_w = init_latents_w.to(torch.float32)
+        init_latents_w = dct.idct_2d(init_latents_w_dct)
+        init_latents_w = init_latents_w.to(torch.float16)
+
     else:
-        raise NotImplementedError(f'w_mask_shape: {args.w_mask_shape}')
-    resized_mask = F.interpolate(watermarking_mask.float(), size=(16, 16), mode='bilinear', align_corners=False)
-    resized_mask = resized_mask > 0.5
-    return resized_mask
-
-
-
-def inject_watermark(init_latents_w, watermarking_mask, gt_patch, args, i, device):
-    # Perform Dual-Tree Complex Wavelet Transform (DTCWT)
-    dwt = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
-    dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
+        raise NotImplementedError(f'w_injection: {args.w_injection}')
     
-    # Apply DTCWT and get the coefficients
-    init_latents_w_dwt, yh = dwt(init_latents_w)
-    
-    # Resize watermarking_mask to match the low-frequency component size
-    resized_mask = F.interpolate(watermarking_mask.float(), size=init_latents_w_dwt.shape[-2:], mode='bilinear', align_corners=False).bool().to(device)
-    
-    # Resize gt_patch to match the low-frequency component size
-    resized_gt_patch = F.interpolate(gt_patch.float(), size=init_latents_w_dwt.shape[-2:], mode='bilinear', align_corners=False).to(device)
-
-    # Ensure data types match
-    if init_latents_w_dwt.dtype != resized_gt_patch.dtype:
-        resized_gt_patch = resized_gt_patch.to(init_latents_w_dwt.dtype)
-    
-    save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_no_w_image.png")
-    save_image(init_latents_w_dwt[0, 0].real, f"{args.output_dir}/image_{i}/dwt_no_w_image.png")  # Save the real part of the low-frequency component
-
-    # Inject watermark into the middle frequency components
-    if len(yh) > 2:  # Ensure there are at least three frequency bands (low, middle, high)
-        # Process middle frequency components, excluding the first (low) and last (high) components
-        for j in range(1, len(yh) - 1):
-            # Resize the watermark mask and patch to match the current frequency component size
-            middle_freq_mask = F.interpolate(watermarking_mask.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).bool().to(device)
-            resized_gt_patch_middle = F.interpolate(gt_patch.float(), size=yh[j].shape[-3:-1], mode='bilinear', align_corners=False).to(device)
-
-            # Ensure data types match
-            if yh[j].dtype != resized_gt_patch_middle.dtype:
-                resized_gt_patch_middle = resized_gt_patch_middle.to(yh[j].dtype)
-
-            # Adjust dimensions for broadcasting
-            middle_freq_mask = middle_freq_mask.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
-            resized_gt_patch_middle = resized_gt_patch_middle.unsqueeze(2).unsqueeze(-1)  # Add dimensions for directions and real/imaginary
-
-            # Broadcast mask and watermark patch to match the shape of yh[j]
-            middle_freq_mask = middle_freq_mask.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
-            resized_gt_patch_middle = resized_gt_patch_middle.expand(-1, -1, yh[j].shape[2], -1, -1, yh[j].shape[-1])
-
-            if args.w_injection == 'complex':
-                yh[j][middle_freq_mask] = resized_gt_patch_middle[middle_freq_mask].clone()
-            elif args.w_injection == 'seed':
-                yh[j] = resized_gt_patch_middle.clone()
-            else:
-                raise NotImplementedError(f'w_injection: {args.w_injection}')
-
-            yh_real_part = yh[j][0, :, 0, :, :, 0].real  # Extract a 2D slice that can be saved as an image
-            yh_real_part = (yh_real_part - yh_real_part.min()) / (yh_real_part.max() - yh_real_part.min())  # Normalize to [0, 1]
-            save_image(yh_real_part, f"{args.output_dir}/image_{i}/yh_w_image_middle_{j}.png")
-
-    # Perform Inverse Dual-Tree Complex Wavelet Transform (IDTCWT)
-    init_latents_w = dtcwt_inverse((init_latents_w_dwt, yh))  # Apply IDWT to get the image back
-
-    save_image(init_latents_w[0], f"{args.output_dir}/image_{i}/latent_w_image.png")
-    return init_latents_w
+    return init_latents_w, watermark_size
 
 
-
-def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args, device):
-    # Initialize the DTCWT and its inverse
-    dwt = DTCWTForward(J=5, biort='near_sym_b', qshift='qshift_b').to(device)
-    dtcwt_inverse = DTCWTInverse(biort='near_sym_b', qshift='qshift_b').to(device)
-    
+def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermark_size,init_latents, args):
+    # Perform DCT on the reversed latents if necessary
     if 'complex' in args.w_measurement:
-        reversed_latents_no_w_dwt, yh_no_w = dwt(reversed_latents_no_w)
-        reversed_latents_w_dwt, yh_w = dwt(reversed_latents_w)
-        target_patch = gt_patch
+        reversed_latents_no_w_dct = dct.dct_2d(reversed_latents_no_w)
+        reversed_latents_w_dct = dct.dct_2d(reversed_latents_w)
     elif 'seed' in args.w_measurement:
-        reversed_latents_no_w_dwt = reversed_latents_no_w
-        reversed_latents_w_dwt = reversed_latents_w
-        target_patch = gt_patch
+        reversed_latents_no_w_dct = reversed_latents_no_w
+        reversed_latents_w_dct = reversed_latents_w
     else:
         raise NotImplementedError(f'w_measurement: {args.w_measurement}')
-
-    # Resize watermarking_mask to match the dimensions of the DWT coefficients
-    resized_mask = F.interpolate(watermarking_mask.float(), size=reversed_latents_no_w_dwt.shape[-2:], mode='bilinear', align_corners=False).bool().to(device)
     
-    if 'l1' in args.w_measurement:
-        # Ensure target_patch is resized to match the DWT coefficient dimensions
-        resized_target_patch = F.interpolate(target_patch.float(), size=reversed_latents_no_w_dwt.shape[-2:], mode='bilinear', align_corners=False).to(device)
+    # Ensure tensors are in float32 for precision
+    reversed_latents_no_w_dct = reversed_latents_no_w_dct.to(torch.float32)
+    reversed_latents_w_dct = reversed_latents_w_dct.to(torch.float32)
 
-        # Evaluate the watermark using L1 norm
-        no_w_metric = torch.abs(reversed_latents_no_w_dwt[resized_mask] - resized_target_patch[resized_mask]).mean().item()
-        w_metric = torch.abs(reversed_latents_w_dwt[resized_mask] - resized_target_patch[resized_mask]).mean().item()
-    else:
-        raise NotImplementedError(f'w_measurement: {args.w_measurement}')
+    # Define the watermark size
+    watermark_h, watermark_w = watermark_size
 
+    # Get the center position for the watermark
+    h, w = reversed_latents_no_w_dct.shape[-2:]
+    center_y, center_x = h // 2, w // 2
+    half_watermark_h, half_watermark_w = watermark_h // 2, watermark_w // 2
+
+    # Define the ROI for watermark comparison
+    no_w_roi = reversed_latents_no_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                       center_x - half_watermark_w:center_x + half_watermark_w]
+    w_roi = reversed_latents_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                   center_x - half_watermark_w:center_x + half_watermark_w]
+    original_roi = init_latents[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                       center_x - half_watermark_w:center_x + half_watermark_w]
+
+    # Compute L1 metrics for the region of interest
+    no_w_metric = torch.abs(no_w_roi - original_roi).mean().item()
+    w_metric = torch.abs(w_roi - no_w_roi).mean().item()  # Metric of change due to watermarking
+    
     return no_w_metric, w_metric
-
-
 
 def get_p_value(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args):
     # assume it's Fourier space wm
-    reversed_latents_no_w_dwt = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))[watermarking_mask].flatten()
-    reversed_latents_w_dwt = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))[watermarking_mask].flatten()
+    reversed_latents_no_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))[watermarking_mask].flatten()
+    reversed_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))[watermarking_mask].flatten()
     target_patch = gt_patch[watermarking_mask].flatten()
 
     target_patch = torch.concatenate([target_patch.real, target_patch.imag])
     
     # no_w
-    reversed_latents_no_w_dwt = torch.concatenate([reversed_latents_no_w_dwt.real, reversed_latents_no_w_dwt.imag])
-    sigma_no_w = reversed_latents_no_w_dwt.std()
+    reversed_latents_no_w_fft = torch.concatenate([reversed_latents_no_w_fft.real, reversed_latents_no_w_fft.imag])
+    sigma_no_w = reversed_latents_no_w_fft.std()
     lambda_no_w = (target_patch ** 2 / sigma_no_w ** 2).sum().item()
-    x_no_w = (((reversed_latents_no_w_dwt - target_patch) / sigma_no_w) ** 2).sum().item()
+    x_no_w = (((reversed_latents_no_w_fft - target_patch) / sigma_no_w) ** 2).sum().item()
     p_no_w = scipy.stats.ncx2.cdf(x=x_no_w, df=len(target_patch), nc=lambda_no_w)
 
     # w
-    reversed_latents_w_dwt = torch.concatenate([reversed_latents_w_dwt.real, reversed_latents_w_dwt.imag])
-    sigma_w = reversed_latents_w_dwt.std()
+    reversed_latents_w_fft = torch.concatenate([reversed_latents_w_fft.real, reversed_latents_w_fft.imag])
+    sigma_w = reversed_latents_w_fft.std()
     lambda_w = (target_patch ** 2 / sigma_w ** 2).sum().item()
-    x_w = (((reversed_latents_w_dwt - target_patch) / sigma_w) ** 2).sum().item()
+    x_w = (((reversed_latents_w_fft - target_patch) / sigma_w) ** 2).sum().item()
     p_w = scipy.stats.ncx2.cdf(x=x_w, df=len(target_patch), nc=lambda_w)
 
     return p_no_w, p_w
+def save_image_to_unique_folder(image, base_dir, index,name):
+    # Define folder path based on index
+    folder_path = os.path.join(base_dir, f"extraction/AppleGrayscaleWatermarkedWithImageBlurring/{index}")
+
+    # Create the folder if it does not exist
+    os.makedirs(folder_path, exist_ok=True)
+
+    # Define the file path
+    file_path = os.path.join(folder_path, f"{name}.png")
+
+    if isinstance(image, Image.Image):
+        # If input is a PIL Image, save it directly
+        image.save(file_path)
+    elif isinstance(image, torch.Tensor):
+        # If input is a tensor, convert it to an image and save
+        save_image(image, file_path)
+    else:
+        raise TypeError("Input must be of type PIL.Image or torch.Tensor")
+
+def saveRocCurve(fpr, tpr, base_dir, index):
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    
+    # Convert the plot to a tensor
+    plt_canvas = plt.gcf().canvas
+    plt_canvas.draw()
+    roc_image = np.array(plt_canvas.renderer.buffer_rgba())
+    roc_tensor = ToTensor()(roc_image)
+    
+    # Save the ROC curve using the provided function
+    save_image_to_unique_folder(roc_tensor, base_dir, index, "roc_curve")
+    
+    # Close the plot
+    plt.close()
+
+def extract_watermark(watermarked_latents, original_latents, watermark_size, pipe, device,args,i):
+    # Ensure the latents are in the correct precision
+    watermarked_latents = watermarked_latents.to(torch.float32)
+    original_latents = original_latents.to(torch.float32)
+    
+    # Perform DCT on the watermarked and original latents
+    watermarked_latents_dct = dct.dct_2d(watermarked_latents)
+    original_latents_dct = dct.dct_2d(original_latents)
+    watermarked_latents_dct = watermarked_latents_dct.to(torch.float16)
+    original_latents_dct = original_latents_dct.to(torch.float16)
+    # Calculate the difference to extract the watermark DCT coefficients
+    watermark_dct = (watermarked_latents_dct - original_latents_dct)/0.2
+    
+    # Define the position of the watermark in the latent space
+    h, w = watermarked_latents_dct.shape[-2:]
+    print(h,w)
+    center_y, center_x = h // 2, w // 2
+    half_watermark_h, half_watermark_w = watermark_size[0] // 2, watermark_size[1] // 2
+    
+    # Extract the watermark from the center of the latent space
+    extracted_watermark_dct = watermark_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                            center_x - half_watermark_w:center_x + half_watermark_w]
+    save_image_to_unique_folder(extracted_watermark_dct, args.output_dir, i, "extracted_watermark_dct")
+    # Resize the extracted watermark back to the original image size if needed
+    # extracted_watermark_dct = F.interpolate(extracted_watermark_dct, size=(64, 64), mode='bilinear', align_corners=False)
+    
+    # Perform IDCT to recover the watermark in the image space
+    extracted_watermark_dct = extracted_watermark_dct.to(torch.float32)
+    extracted_watermark = dct.idct_2d(extracted_watermark_dct)
+    extracted_watermark = extracted_watermark.to(torch.float16)
+    return extracted_watermark
