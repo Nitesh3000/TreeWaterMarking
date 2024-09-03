@@ -227,101 +227,95 @@ def get_watermarking_pattern(pipe, args, device, shape=None):
 
 def readImage(image_path,args,i):
     image = Image.open(image_path).convert('RGB')
-    save_image_to_unique_folder(image, args.output_dir, i,"apple_image_for_watermarking")
+    # save_image_to_unique_folder(image, args.output_dir, i,"apple_image_for_watermarking")
     
     image_tensor = ToTensor()(image)
     # if image_tensor.shape[0] == 4:
     #     image_tensor = image_tensor[:3, :, :]
-    save_image_to_unique_folder(image_tensor, args.output_dir, i,"apple_image_for_watermarking_tensor")
+    # save_image_to_unique_folder(image_tensor, args.output_dir, i,"apple_image_for_watermarking_tensor")
     # image_tensor = torch.tensor(np.array(image)).float() / 255.0
     image_tensor = image_tensor.unsqueeze(0)
-    image_tensor = image_tensor.to(torch.float16)
+    
     # image_tensor = image_tensor.expand([1,3,475,584])
     return image_tensor
 
-def inject_watermark(init_latents_w, image, args, pipe, device,i):
+def inject_watermark(init_latents_w, image, args, pipe, device, i):
     # Obtain the latent representation of the image
     image_latents = pipe.get_image_latents(image.to(device), sample=False)
-    save_image_to_unique_folder(image_latents, args.output_dir, i,"imageforwatermarkingLatents")
-    image_latents = image_latents.to(torch.float32)
-    watermark_size = (32, 32)  # Size of the watermark to be inserted
+    # save_image_to_unique_folder(image_latents, args.output_dir, i, "imageforwatermarkingLatents")
+    
+    watermark_size = (16,16)  # Size of the watermark to be inserted
 
-        # Resize the watermark
+    # Resize the watermark
     image_latents = F.interpolate(image_latents, size=watermark_size, mode='bilinear', align_corners=False)
-    # Perform DCT on the image latents
-    dct_image = dct.dct_2d(image_latents)
-    dct_image = dct_image.to(torch.float16)
-    save_image_to_unique_folder(dct_image, args.output_dir, i,"imageforwatermarkingLatents_DCT")
+    # Perform FFT on the image latents
+    # fft_image = torch.fft.fft2(image_latents, s=watermark_size)
+    fft_image = torch.fft.fftshift(torch.fft.fft2(image_latents), dim=(-1, -2))
+    
+    # save_image_to_unique_folder(fft_image, args.output_dir, i, "imageforwatermarkingLatents_FFT")
     
     if args.w_injection == 'complex':
-        init_latents_w = init_latents_w.clone()
-        save_image_to_unique_folder(init_latents_w, args.output_dir, i,"init_latents_w_not_watermarked")
-        init_latents_w = init_latents_w.to(torch.float32)
+        # save_image_to_unique_folder(init_latents_w, args.output_dir, i, "init_latents_w_not_watermarked")
         
-        # Perform DCT on the initial latents
-        init_latents_w_dct = dct.dct_2d(init_latents_w)
-        init_latents_w_dct = init_latents_w_dct.to(torch.float16)
-        save_image_to_unique_folder(init_latents_w_dct, args.output_dir, i,"init_latents_w_dct_not_watermarked")
+        # Perform FFT on the initial latents
+        # init_latents_w_fft = torch.fft.fft2(init_latents_w)
+        init_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(init_latents_w), dim=(-1, -2))
+        # init_latents_w_fft = init_latents_w_fft.to(torch.float16)
+        # save_image_to_unique_folder(init_latents_w_fft, args.output_dir, i, "init_latents_w_fft_not_watermarked")
         
-        watermark_scale = 0.2
-        # watermark_size = (32, 32)  # Size of the watermark to be inserted
-
-        # Resize the watermark
-        # dct_image_resized = F.interpolate(dct_image, size=watermark_size, mode='bilinear', align_corners=False)
+        watermark_scale = 0.5
 
         # Define the position to place the watermark (center of the latent image)
-        h, w = init_latents_w_dct.shape[-2:]
+        h, w = init_latents_w_fft.shape[-2:]
         center_y, center_x = h // 2, w // 2
         half_watermark_h, half_watermark_w = watermark_size[0] // 2, watermark_size[1] // 2
 
         # Add the watermark to the center of the existing latents
-        init_latents_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+        init_latents_w_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
                            center_x - half_watermark_w:center_x + half_watermark_w] += (
-            watermark_scale * dct_image
+            watermark_scale * fft_image
         )
-        save_image_to_unique_folder(init_latents_w_dct, args.output_dir, i,"init_latents_w_dct after watermark injection")
+        # save_image_to_unique_folder(init_latents_w_fft, args.output_dir, i, "init_latents_w_fft_after_watermark_injection")
 
-        # Perform IDCT to get back to the image space
-        init_latents_w = init_latents_w.to(torch.float32)
-        init_latents_w = dct.idct_2d(init_latents_w_dct)
-        init_latents_w = init_latents_w.to(torch.float16)
+        # Perform IFFT to get back to the image space
+        init_latents_w = torch.fft.ifft2(torch.fft.ifftshift(init_latents_w_fft, dim=(-1, -2)))
+        
 
     else:
         raise NotImplementedError(f'w_injection: {args.w_injection}')
     
-    return init_latents_w, watermark_size
+    return init_latents_w.real, watermark_size
 
 
-def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermark_size,init_latents, args):
-    # Perform DCT on the reversed latents if necessary
+def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermark_size, init_latents, args):
+    # Perform FFT on the reversed latents if necessary
     if 'complex' in args.w_measurement:
-        reversed_latents_no_w_dct = dct.dct_2d(reversed_latents_no_w)
-        reversed_latents_w_dct = dct.dct_2d(reversed_latents_w)
+        
+        reversed_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))
+        reversed_latents_no_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))
+        
     elif 'seed' in args.w_measurement:
-        reversed_latents_no_w_dct = reversed_latents_no_w
-        reversed_latents_w_dct = reversed_latents_w
+        reversed_latents_no_w_fft = reversed_latents_no_w
+        reversed_latents_w_fft = reversed_latents_w
     else:
         raise NotImplementedError(f'w_measurement: {args.w_measurement}')
     
-    # Ensure tensors are in float32 for precision
-    reversed_latents_no_w_dct = reversed_latents_no_w_dct.to(torch.float32)
-    reversed_latents_w_dct = reversed_latents_w_dct.to(torch.float32)
 
     # Define the watermark size
     watermark_h, watermark_w = watermark_size
 
     # Get the center position for the watermark
-    h, w = reversed_latents_no_w_dct.shape[-2:]
+    h, w = reversed_latents_no_w_fft.shape[-2:]
     center_y, center_x = h // 2, w // 2
     half_watermark_h, half_watermark_w = watermark_h // 2, watermark_w // 2
 
     # Define the ROI for watermark comparison
-    no_w_roi = reversed_latents_no_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
-                                       center_x - half_watermark_w:center_x + half_watermark_w]
-    w_roi = reversed_latents_w_dct[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
-                                   center_x - half_watermark_w:center_x + half_watermark_w]
+    no_w_roi = reversed_latents_no_w_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                        center_x - half_watermark_w:center_x + half_watermark_w]
+    w_roi = reversed_latents_w_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                    center_x - half_watermark_w:center_x + half_watermark_w]
     original_roi = init_latents[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
-                                       center_x - half_watermark_w:center_x + half_watermark_w]
+                                        center_x - half_watermark_w:center_x + half_watermark_w]
 
     # Compute L1 metrics for the region of interest
     no_w_metric = torch.abs(no_w_roi - original_roi).mean().item()
@@ -329,27 +323,73 @@ def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermark_size,ini
     
     return no_w_metric, w_metric
 
-def get_p_value(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, args):
-    # assume it's Fourier space wm
-    reversed_latents_no_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))[watermarking_mask].flatten()
-    reversed_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))[watermarking_mask].flatten()
-    target_patch = gt_patch[watermarking_mask].flatten()
+def get_p_value(reversed_latents_no_w, reversed_latents_w, image, watermark_size, device, args, pipe,i):
+    # Obtain and process image latents
+    image_latents = pipe.get_image_latents(image.to(device), sample=False)
+    image_latents = image_latents.to(torch.float32)
 
-    target_patch = torch.concatenate([target_patch.real, target_patch.imag])
+    # Resize the image latents to match the watermark size
+    image_latents_resized = F.interpolate(image_latents, size=(reversed_latents_w.shape[-2], reversed_latents_w.shape[-1]), mode='bilinear', align_corners=False)
+
+    # Perform FFT on the resized image latents
+    image_fft = torch.fft.fftshift(torch.fft.fft2(image_latents_resized), dim=(-1, -2))
+    # print(f"image_fft size: {image_fft.shape}")
+
+    # Perform FFT on the reversed latents
+    reversed_latents_no_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))
+    reversed_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))
+    # print(f"reversed_latents_no_w_fft size: {reversed_latents_no_w_fft.shape}")
+    # Define the region of interest (ROI) based on watermark size
+    h, w = reversed_latents_w.shape[-2:]
+    center_y, center_x = h // 2, w // 2
+    half_watermark_h, half_watermark_w = watermark_size[0] // 2, watermark_size[1] // 2
+    # print(f"center_y: {center_y}, center_x: {center_x}, half_watermark_h: {half_watermark_h}, half_watermark_w: {half_watermark_w}")
+
+    # Extract ROIs
+    no_w_roi = reversed_latents_no_w_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                                 center_x - half_watermark_w:center_x + half_watermark_w]
+    w_roi = reversed_latents_w_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                           center_x - half_watermark_w:center_x + half_watermark_w]
+    gt_patch_fft = image_fft[:, :, center_y - half_watermark_h:center_y + half_watermark_h,
+                                      center_x - half_watermark_w:center_x + half_watermark_w]
     
-    # no_w
-    reversed_latents_no_w_fft = torch.concatenate([reversed_latents_no_w_fft.real, reversed_latents_no_w_fft.imag])
-    sigma_no_w = reversed_latents_no_w_fft.std()
-    lambda_no_w = (target_patch ** 2 / sigma_no_w ** 2).sum().item()
-    x_no_w = (((reversed_latents_no_w_fft - target_patch) / sigma_no_w) ** 2).sum().item()
-    p_no_w = scipy.stats.ncx2.cdf(x=x_no_w, df=len(target_patch), nc=lambda_no_w)
+    # print(f"gt_patch_fft size: {gt_patch_fft.shape}")
 
-    # w
-    reversed_latents_w_fft = torch.concatenate([reversed_latents_w_fft.real, reversed_latents_w_fft.imag])
-    sigma_w = reversed_latents_w_fft.std()
-    lambda_w = (target_patch ** 2 / sigma_w ** 2).sum().item()
-    x_w = (((reversed_latents_w_fft - target_patch) / sigma_w) ** 2).sum().item()
-    p_w = scipy.stats.ncx2.cdf(x=x_w, df=len(target_patch), nc=lambda_w)
+    # Check if gt_patch_fft is empty
+    if gt_patch_fft.numel() == 0:
+        raise ValueError("gt_patch_fft is empty. Check ROI extraction.")
+
+    # Flatten the ROIs and the ground truth patch
+    gt_patch_fft_flattened = torch.cat([gt_patch_fft.real.flatten(), gt_patch_fft.imag.flatten()]).to(device)
+    no_w_roi_fft = torch.cat([no_w_roi.real.flatten(), no_w_roi.imag.flatten()]).to(device)
+    w_roi_fft = torch.cat([w_roi.real.flatten(), w_roi.imag.flatten()]).to(device)
+    
+    # Ensure the sizes match
+    assert gt_patch_fft_flattened.size(0) == no_w_roi_fft.size(0), \
+        f"Size mismatch: gt_patch {gt_patch_fft_flattened.size(0)}, no_w_roi {no_w_roi_fft.size(0)}"
+    assert gt_patch_fft_flattened.size(0) == w_roi_fft.size(0), \
+        f"Size mismatch: gt_patch {gt_patch_fft_flattened.size(0)}, w_roi {w_roi_fft.size(0)}"
+
+    # Compute the standard deviations (σ)
+    sigma_no_w = no_w_roi_fft.std()  # Ensure sigma is not zero
+    sigma_w = w_roi_fft.std()  # Ensure sigma is not zero
+    # print(sigma_no_w.item(), sigma_w.item())
+
+    # Compute the non-centrality parameters (λ)
+    lambda_no_w = (gt_patch_fft_flattened ** 2 / sigma_no_w ** 2).sum().item()
+    lambda_w = (gt_patch_fft_flattened ** 2 / sigma_w ** 2).sum().item()
+    # print(lambda_no_w, lambda_w)
+
+    # Compute the scores (η)
+    x_no_w = (((no_w_roi_fft - gt_patch_fft_flattened) / sigma_no_w) ** 2).sum().item()
+    x_w = (((w_roi_fft - gt_patch_fft_flattened) / sigma_w) ** 2).sum().item()
+    # print(x_no_w, x_w)
+
+    # Compute the P-values using the non-central chi-squared distribution
+    p_no_w = scipy.stats.ncx2.cdf(x=x_no_w, df=len(gt_patch_fft_flattened), nc=lambda_no_w)
+    p_w = scipy.stats.ncx2.cdf(x=x_w, df=len(gt_patch_fft_flattened), nc=lambda_w)
+    # print(p_no_w, p_w)
+    save_results_to_excel(i, p_no_w, p_w, folder_path='detecting Threshold for Non Distortion for 8 fft image watermark for scale 1')
 
     return p_no_w, p_w
 def save_image_to_unique_folder(image, base_dir, index,name):
@@ -367,7 +407,7 @@ def save_image_to_unique_folder(image, base_dir, index,name):
         image.save(file_path)
     elif isinstance(image, torch.Tensor):
         # If input is a tensor, convert it to an image and save
-        save_image(image, file_path)
+        save_image(image.real, file_path)
     else:
         raise TypeError("Input must be of type PIL.Image or torch.Tensor")
 
@@ -422,3 +462,70 @@ def extract_watermark(watermarked_latents, original_latents, watermark_size, pip
     extracted_watermark = dct.idct_2d(extracted_watermark_dct)
     extracted_watermark = extracted_watermark.to(torch.float16)
     return extracted_watermark
+
+def plot_and_save_pw_and_pnow(p_no_w, p_w, base_dir, index):
+    # Generate image numbers
+    image_numbers = np.arange(len(p_w))
+
+    # Create DataFrame
+    df = pd.DataFrame({
+        'Image Number': image_numbers,
+        'p_no_w': p_no_w,
+        'p_w': p_w
+    })
+
+    # Plotting
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['Image Number'], df['p_no_w'], marker='o', linestyle='-', color='b', label='p_no_w')
+    plt.plot(df['Image Number'], df['p_w'], marker='o', linestyle='-', color='r', label='p_w')
+
+    # Adding labels and title
+    plt.xlabel('Image Number')
+    plt.ylabel('Values')
+    plt.title('Plot of p_no_w and p_w Values')
+    plt.yscale('log')  # Use logarithmic scale for better visualization of wide range values
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # Convert the plot to a tensor
+    plt_canvas = plt.gcf().canvas
+    plt_canvas.draw()
+    plot_image = np.array(plt_canvas.renderer.buffer_rgba())
+    plot_tensor = ToTensor()(plot_image)
+
+    # Save the plot using the provided function
+    plot_path = save_image_to_unique_folder(plot_tensor, base_dir, index, "pw_pnow_plot")
+
+    # Close the plot
+    plt.close()  # Close the figure to avoid memory leaks
+
+    print(f"Plot saved as {plot_path}")
+    
+import pandas as pd
+
+def save_results_to_excel(image_number, p_no_w, p_w, folder_path='results_folder', file_name='results.xlsx'):
+    # Ensure the folder exists, if not, create it
+    os.makedirs(folder_path, exist_ok=True)
+
+    # Define the full file path
+    file_path = os.path.join(folder_path, file_name)
+
+    # Define column names
+    columns = ['Image Number', 'p_no_w', 'p_w']
+
+    # Check if the file already exists
+    if os.path.exists(file_path):
+        # Load existing data
+        df = pd.read_excel(file_path)
+    else:
+        # Create a new DataFrame with the specified columns
+        df = pd.DataFrame(columns=columns)
+
+    # Create a DataFrame for the new row
+    new_row_df = pd.DataFrame([[image_number, p_no_w, p_w]], columns=columns)
+
+    # Append the new row using pd.concat
+    df = pd.concat([df, new_row_df], ignore_index=True)
+
+    # Save the DataFrame back to the Excel file in the specified folder
+    df.to_excel(file_path, index=False)

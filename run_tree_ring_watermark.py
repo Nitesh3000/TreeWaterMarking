@@ -73,7 +73,8 @@ def main(args):
     clip_scores_w = []
     no_w_metrics = []
     w_metrics = []
-
+    p_values_no_w = []
+    p_values_w = []
     for i in tqdm(range(args.start, args.end)):
         seed = i + args.gen_seed
         
@@ -93,7 +94,7 @@ def main(args):
             )
         orig_image_no_w = outputs_no_w.images[0]
         save_image_to_unique_folder(orig_image_no_w, base_dir, i,"orig_image_no_w")
-
+        
         
         if init_latents_no_w is None:
             set_random_seed(seed)
@@ -104,10 +105,11 @@ def main(args):
         
         # Inject watermark
         # watermarking_mask = get_watermarking_mask(init_latents_w, args, device)
-        imageforwatermark = readImage("Fresh_Apple_PNG_Clip_Art_Image.png",args,i) #grayscale image(if not, will be converted in the function)
+        imageforwatermark = readImage("th (1).jpeg",args,i) #grayscale image(if not, will be converted in the function)
         init_latents_w,watermark_size = inject_watermark(init_latents_w_original,imageforwatermark, args,pipe,device,i)
-        save_image_to_unique_folder(init_latents_w, base_dir, i,"init_latents_w_watermarked")
+        # save_image_to_unique_folder(init_latents_w, base_dir, i,"init_latents_w_watermarked")
         # Reverse latent space to get watermarked DCT image
+        # print(init_latents_w.dtype)
         outputs_w = pipe(
             current_prompt,
             num_images_per_prompt=args.num_images,
@@ -115,7 +117,7 @@ def main(args):
             num_inference_steps=args.num_inference_steps,
             height=args.image_length,
             width=args.image_length,
-            latents=init_latents_w,
+            latents=init_latents_w.to(torch.float16),
             
         )
         orig_image_w = outputs_w.images[0]
@@ -127,9 +129,9 @@ def main(args):
         save_image_to_unique_folder(orig_image_w_auged, base_dir, i,"orig_image_w_auged")
         # Reverse img without watermarking
         img_no_w = transform_img(orig_image_no_w_auged).unsqueeze(0).to(text_embeddings.dtype).to(device)
-        save_image_to_unique_folder(img_no_w, base_dir, i,"img_no_w")
+        # save_image_to_unique_folder(img_no_w, base_dir, i,"img_no_w")
         image_latents_no_w = pipe.get_image_latents(img_no_w, sample=False)
-        save_image_to_unique_folder(image_latents_no_w, base_dir, i,"image_latents_no_w")
+        # save_image_to_unique_folder(image_latents_no_w, base_dir, i,"image_latents_no_w")
 
         reversed_latents_no_w = pipe.forward_diffusion(
             latents=image_latents_no_w,
@@ -140,9 +142,9 @@ def main(args):
 
         # Reverse img with watermarking
         img_w = transform_img(orig_image_w_auged).unsqueeze(0).to(text_embeddings.dtype).to(device)
-        save_image_to_unique_folder(img_w, base_dir, i,"img_w")
+        # save_image_to_unique_folder(img_w, base_dir, i,"img_w")
         image_latents_w = pipe.get_image_latents(img_w, sample=False)
-        save_image_to_unique_folder(image_latents_w, base_dir, i,"image_latents_w")
+        # save_image_to_unique_folder(image_latents_w, base_dir, i,"image_latents_w")
 
         reversed_latents_w = pipe.forward_diffusion(
             latents=image_latents_w,
@@ -153,7 +155,8 @@ def main(args):
 
         # Evaluation
         no_w_metric, w_metric = eval_watermark(reversed_latents_no_w, reversed_latents_w,watermark_size,init_latents_w_original, args)
-
+        # Compute p-values
+        p_no_w, p_w = get_p_value(reversed_latents_no_w, reversed_latents_w, imageforwatermark, watermark_size, device,args,pipe,i)
         if args.reference_model is not None:
             sims = measure_similarity([orig_image_no_w, orig_image_w], current_prompt, ref_model, ref_clip_preprocess, ref_tokenizer, device)
             w_no_sim = sims[0].item()
@@ -168,7 +171,9 @@ def main(args):
 
         no_w_metrics.append(-no_w_metric)
         w_metrics.append(-w_metric)
-
+        p_values_no_w.append(p_no_w)
+        p_values_w.append(p_w)
+        
         if args.with_tracking:
             if (args.reference_model is not None) and (i < args.max_num_log_image):
                 # Log images when using a reference model
@@ -180,12 +185,12 @@ def main(args):
             clip_scores_w.append(w_sim)
             
             
-        extracted_watermark_latents = extract_watermark(init_latents_w, init_latents_w_original, watermark_size, pipe, device,args,i)
-        save_image_to_unique_folder(extracted_watermark_latents, base_dir, i,"extracted_watermark_latents")
-        extracted_watermark_image = latents_to_imgs(pipe, extracted_watermark_latents)
-        save_image_to_unique_folder(extracted_watermark_image[0], base_dir, i, "extracted_watermark")
+        # extracted_watermark_latents = extract_watermark(reversed_latents_w, init_latents_w_original, watermark_size, pipe, device,args,i)
+        # save_image_to_unique_folder(extracted_watermark_latents, base_dir, i,"extracted_watermark_latents")
+        # extracted_watermark_image = latents_to_imgs(pipe, extracted_watermark_latents)
+        # save_image_to_unique_folder(extracted_watermark_image[0], base_dir, i, "extracted_watermark")
 
-    # ROC
+    # ROC for metrics
     preds = no_w_metrics +  w_metrics
     t_labels = [0] * len(no_w_metrics) + [1] * len(w_metrics)
 
@@ -193,7 +198,24 @@ def main(args):
     auc = metrics.auc(fpr, tpr)
     acc = np.max(1 - (fpr + (1 - tpr))/2)
     low = tpr[np.where(fpr < 0.01)[0][-1]]
-
+    max_threshold = thresholds[np.argmax(1 - (fpr + (1 - tpr)) / 2)]
+    average_threshold = np.mean(thresholds)
+    min_threshold = np.min(thresholds)
+    max_threshold_val = np.max(thresholds)
+    thresholds_at_1_fpr = thresholds[np.where(fpr < 0.01)[0]]
+    
+    print("\n\n\n")
+    print(f'auc: {auc}, acc: {acc}, TPR@1%FPR: {low}')
+    print(f'Best Threshold for classification: {max_threshold}')
+    print(f'Average Threshold: {average_threshold}')
+    print(f'Minimum Threshold: {min_threshold}')
+    print(f'Maximum Threshold: {max_threshold_val}')
+    print(f'Thresholds at FPR < 1%: {thresholds_at_1_fpr}')
+    saveRocCurve(fpr, tpr,base_dir,i)
+    print("\n\n\n")
+    
+    plot_and_save_pw_and_pnow(p_values_no_w, p_values_w, base_dir,i)
+    
     if args.with_tracking:
         wandb.log({'Table': table})
         wandb.log({'clip_score_mean': mean(clip_scores), 'clip_score_std': stdev(clip_scores),
@@ -202,8 +224,7 @@ def main(args):
     
         print(f'clip_score_mean: {mean(clip_scores)}')
         print(f'w_clip_score_mean: {mean(clip_scores_w)}')
-    print(f'auc: {auc}, acc: {acc}, TPR@1%FPR: {low}')
-    saveRocCurve(fpr, tpr,base_dir,i)
+    
    
 
 if __name__ == '__main__':
@@ -213,7 +234,7 @@ if __name__ == '__main__':
     # parser.add_argument('--dataset', default='Gustavosta/Stable-Diffusion-Prompts')
     parser.add_argument('--output_dir', default='output_images', type=str)
     parser.add_argument('--start', default=0, type=int)
-    parser.add_argument('--end', default=10, type=int)
+    parser.add_argument('--end', default=1000, type=int)
     parser.add_argument('--image_length', default=256, type=int)
     parser.add_argument('--model_id', default='stabilityai/stable-diffusion-2-1-base')
     parser.add_argument('--with_tracking', action='store_true')

@@ -11,7 +11,8 @@ from diffusers import DPMSolverMultistepScheduler
 from optim_utils import *
 from io_utils import *
 from pytorch_fid.fid_score import *
-
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+torch.set_default_dtype(torch.float16)
 
 def main(args):
     table = None
@@ -45,7 +46,7 @@ def main(args):
     os.makedirs(w_dir, exist_ok=True)
 
     # ground-truth patch
-    gt_patch = get_watermarking_pattern(pipe, args, device)
+    # gt_patch = get_watermarking_pattern(pipe, args, device)
 
     for i in tqdm(range(args.start, args.end)):
         seed = i + args.gen_seed
@@ -74,15 +75,17 @@ def main(args):
         # generation with watermarking
         if init_latents_no_w is None:
             set_random_seed(seed)
-            init_latents_w = pipe.get_random_latents()
+            init_latents_w_original = pipe.get_random_latents()
         else:
-            init_latents_w = copy.deepcopy(init_latents_no_w)
+            init_latents_w_original = copy.deepcopy(init_latents_no_w)
+
 
         # get watermarking mask
-        watermarking_mask = get_watermarking_mask(init_latents_w, args, device)
+        # watermarking_mask = get_watermarking_mask(init_latents_w, args, device)
 
         # inject watermark
-        init_latents_w = inject_watermark(init_latents_w, watermarking_mask,gt_patch, args)
+        imageforwatermark = readImage("th (1).jpeg",args,i) #grayscale image(if not, will be converted in the function)
+        init_latents_w,watermark_size = inject_watermark(init_latents_w_original,imageforwatermark, args,pipe,device,i)
 
         outputs_w = pipe(
             current_prompt,
@@ -145,7 +148,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='diffusion watermark')
     parser.add_argument('--run_name', default='test')
     parser.add_argument('--start', default=0, type=int)
-    parser.add_argument('--end', default=10, type=int)
+    parser.add_argument('--end', default=5000, type=int)
+    parser.add_argument('--output_dir', default='output_images', type=str)
     parser.add_argument('--image_length', default=512, type=int)
     parser.add_argument('--model_id', default='stabilityai/stable-diffusion-2-1-base')
     parser.add_argument('--with_tracking', action='store_true')
