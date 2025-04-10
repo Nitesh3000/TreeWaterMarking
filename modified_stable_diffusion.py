@@ -1,4 +1,3 @@
-
 from typing import Callable, List, Optional, Union, Any, Dict
 import copy
 import numpy as np
@@ -7,10 +6,69 @@ import PIL
 import torch
 from diffusers import StableDiffusionPipeline
 from diffusers.utils import logging, BaseOutput
+import sys
 
+import torch_dct as dct
+
+import torch_dct
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+from PIL import Image  # Import the Image class from the PIL module
+
+from torchvision import models, transforms
+def inject_watermark_into_latents(init_latents_w, watermark_tensor, new_size=(8, 8), scale=1.0, 
+                                  training_step=None, total_steps=None, target_channel=0, batch_size=None):
+    """
+    Injects a watermark into the latent space by applying DCT and modifying the magnitude of coefficients.
+    
+    Args:
+        init_latents_w: The initial latent tensor of shape [batch_size, channels, height, width].
+        watermark_image_path: Path to the watermark image (grayscale).
+        new_size: Size to resize the watermark to (default 16x16).
+        scale: The scaling factor to control watermark strength.
+        training_step: The current training step for gradual scaling.
+        total_steps: Total training steps for gradual scaling.
+        target_channel: The channel in the latent space to apply the watermark.
+        batch_size: The batch size for the images and watermark.
+    
+    Returns:
+        The modified latents with the watermark injected.
+    """
+    
+
+    watermark_tensor = watermark_tensor.to(init_latents_w.device)
+
+ 
+    _, _, h, w = init_latents_w.shape
+
+    center_h, center_w = h // 2, w // 2
+    start_h, start_w = center_h - new_size[0] // 2, center_w - new_size[1] // 2
+    end_h, end_w = start_h + new_size[0], start_w + new_size[1]
+
+    # Perform DCT on the latents and watermark
+    dct_latents = dct.dct_2d(init_latents_w)
+    dct_watermark = dct.dct_2d(watermark_tensor)  # Perform DCargsT on the watermark tensor
+
+    
+
+    if training_step is not None and total_steps is not None:
+        scale_factor = scale * (1 - (training_step / total_steps))  # Gradual scaling based on training step
+    else:
+        scale_factor = scale
 
 
+    dct_watermark = dct_watermark * scale_factor
+
+ 
+    # print(f"dct_watermark: {dct_watermark.shape}")
+    # print(f"dct_latents: {dct_latents.shape}")
+   
+    # dct_latents[:, target_channel, start_h:end_h, start_w:end_w] = dct_latents[:, target_channel, start_h:end_h, start_w:end_w] + dct_watermark[:, 0, :, :]  # Select the first channel of watermark
+    dct_latents[:, target_channel, start_h:end_h, start_w:end_w] = dct_watermark[:, 0, :, :]  # Select the first channel of watermark
+    # print(f"dct_latents: {dct_latents.shape}")
+    modified_latents = dct.idct_2d(dct_latents)
+
+
+    return modified_latents
 class ModifiedStableDiffusionPipelineOutput(BaseOutput):
     images: Union[List[PIL.Image.Image], np.ndarray]
     nsfw_content_detected: Optional[List[bool]]
@@ -57,6 +115,11 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
         watermarking_gamma: float = None,
         watermarking_delta: float = None,
         watermarking_mask: Optional[torch.BoolTensor] = None,
+        process_condition: Optional[Callable[[torch.Tensor], bool]] = None,
+        watermark_image: Optional[torch.FloatTensor] = None,
+        justvae: Optional[Callable[[torch.Tensor], bool]] = None,
+        watermark_size: Optional[int] = None,  # New parameter; default could be computed externally as args.resize_watermark/8.
+        target_channel: Optional[int] = None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -112,11 +175,18 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
+        
+        if(justvae):
+            image = self.decode_latents(latents)
         # 0. Default height and width to unet
+        
+        
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 1. Check inputs. Raise error if not correct
+        height = 128
+        width = 128
         self.check_inputs(prompt, height, width, callback_steps)
 
         # 2. Define call parameters
@@ -187,9 +257,27 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
-
-        # 8. Post-processing
+         # 8. Post-processing
+       
+        if process_condition:
+           
+            print(target_channel)
+           
+            latents = inject_watermark_into_latents(
+                latents,       # The latent vector from the encoder.
+                watermark_image,          # Pass the transformed watermark image tensor.
+                new_size=(watermark_size, watermark_size),
+                scale=1,
+                target_channel=int(target_channel),
+                batch_size=1
+            )
+        else:
+           
+            pass
+            # If no condition is provided, use the original image
         image = self.decode_latents(latents)
+       
+        
 
         # 9. Run safety checker
         image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
@@ -228,3 +316,6 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
             encoding = encoding_dist.mode()
         latents = encoding * 0.18215
         return latents
+    @torch.inference_mode()
+    def get_latents_image(self, latent):
+        return self.decode_latents(latent)
